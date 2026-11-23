@@ -70,6 +70,7 @@ export default function MysqlIntegration() {
   const [copiedSchema, setCopiedSchema] = useState(false);
   const [copiedQueries, setCopiedQueries] = useState(false);
   const [copiedEnv, setCopiedEnv] = useState(false);
+  const [copiedClientIp, setCopiedClientIp] = useState(false);
 
   const [autoSync, setAutoSync] = useState<boolean>(isAutoSyncEnabled());
   const [autoSyncRunning, setAutoSyncRunning] = useState<boolean>(isAutoSyncRunning());
@@ -265,10 +266,14 @@ APP_URL="http://localhost:3000"`;
               )}
             </div>
           ) : (
-            <div className="flex items-center gap-2 px-3.5 py-2 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-700 dark:text-amber-400 text-xs font-bold">
+            <button
+              type="button"
+              onClick={() => setActiveTab('status')}
+              className="flex items-center gap-2 px-3.5 py-2 rounded-2xl bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-700 dark:text-amber-400 text-xs font-bold transition-colors"
+            >
               <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
               <span>Mode Store Server Lokal</span>
-            </div>
+            </button>
           )}
         </div>
       </div>
@@ -436,7 +441,7 @@ APP_URL="http://localhost:3000"`;
         <div className="space-y-6">
           {mysqlStatus && (
             <div
-              className={`p-4 rounded-2xl border flex items-start gap-3.5 text-xs ${
+              className={`p-4 rounded-2xl border flex flex-col sm:flex-row items-start gap-3.5 text-xs ${
                 mysqlStatus.connected
                   ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200'
                   : 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200'
@@ -447,11 +452,61 @@ APP_URL="http://localhost:3000"`;
               ) : (
                 <AlertCircle className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
               )}
-              <div className="space-y-1 flex-1">
-                <p className="font-bold text-sm">
-                  {mysqlStatus.connected ? 'Koneksi MySQL Aktif' : 'Status Koneksi MySQL'}
-                </p>
-                <p>{mysqlStatus.message}</p>
+              <div className="space-y-1.5 flex-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <p className="font-bold text-sm">
+                    {mysqlStatus.connected ? 'Koneksi MySQL Aktif' : 'MySQL Belum Terhubung'}
+                  </p>
+                  {mysqlStatus.errorCode && !mysqlStatus.connected && (
+                    <span className="px-2 py-0.5 rounded bg-amber-500/20 font-mono text-[10px] font-bold">
+                      {mysqlStatus.errorCode}
+                    </span>
+                  )}
+                </div>
+                <p className="leading-relaxed">{mysqlStatus.message}</p>
+                {!mysqlStatus.connected && mysqlStatus.errorCode === 'ER_ACCESS_DENIED_ERROR' && (
+                  <div className="mt-2 p-3 rounded-xl bg-white/70 dark:bg-slate-900/60 border border-amber-300/60 dark:border-amber-700/50 space-y-2 text-[11px]">
+                    <p className="font-bold">Cara Mengatasi Akses Ditolak (Hostinger Remote MySQL):</p>
+                    <ol className="list-decimal pl-4 space-y-1 leading-relaxed">
+                      <li>
+                        Buka <strong>Hostinger hPanel → Databases → Remote MySQL</strong> untuk database{' '}
+                        <code className="font-mono font-bold">{mysqlStatus.database}</code>.
+                      </li>
+                      <li>
+                        Tambahkan <code className="font-mono font-bold">%</code> (Any Host) atau alamat IP server aplikasi ini
+                        {mysqlStatus.clientIp ? (
+                          <span className="inline-flex items-center gap-1.5 ml-1">
+                            <code className="font-mono font-bold px-1.5 py-0.5 rounded bg-amber-500/20">
+                              {mysqlStatus.clientIp}
+                            </code>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                navigator.clipboard.writeText(mysqlStatus.clientIp || '');
+                                setCopiedClientIp(true);
+                                setTimeout(() => setCopiedClientIp(false), 2000);
+                              }}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 text-white text-[10px] font-semibold"
+                            >
+                              {copiedClientIp ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                              <span>{copiedClientIp ? 'Tersalin' : 'Salin IP'}</span>
+                            </button>
+                          </span>
+                        ) : null}
+                        , lalu klik <strong>Create</strong>.
+                      </li>
+                      <li>
+                        Pastikan <code className="font-mono font-bold">MYSQL_USER</code> ({mysqlStatus.userMasked || 'user MySQL'}) dan{' '}
+                        <code className="font-mono font-bold">MYSQL_PASSWORD</code> di Secrets sesuai dengan password user database di Hostinger (bukan password login hPanel).
+                      </li>
+                    </ol>
+                  </div>
+                )}
+                {!mysqlStatus.connected && mysqlStatus.errorCode === 'NOT_CONFIGURED' && (
+                  <p className="text-[11px] opacity-90 pt-1">
+                    <strong>Catatan Hosting vs Preview:</strong> Variabel <code className="font-mono">.env</code> belum diisi, sehingga data sementara tetap tersimpan aman di <code className="font-mono">data/store.json</code>. Saat dijalankan dengan variabel <code className="font-mono">MYSQL_*</code> terisi, server Node.js otomatis terhubung ke MySQL.
+                  </p>
+                )}
               </div>
               <button
                 type="button"
@@ -465,10 +520,45 @@ APP_URL="http://localhost:3000"`;
             </div>
           )}
 
-          {/* Table Checklist */}
+          {/* Env Variables Status Checklist */}
           <div className="bg-white dark:bg-slate-800 rounded-3xl p-6 sm:p-8 border border-slate-200 dark:border-slate-700 shadow-sm space-y-4">
             <h2 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
               <Server className="w-5 h-5 text-blue-500" />
+              <span>Status Variabel Server MySQL</span>
+            </h2>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
+              {[
+                { key: 'MYSQL_HOST', set: Boolean(mysqlStatus?.envStatus?.hostSet) },
+                { key: 'MYSQL_PORT', set: Boolean(mysqlStatus?.envStatus?.portSet) },
+                { key: 'MYSQL_USER', set: Boolean(mysqlStatus?.envStatus?.userSet) },
+                { key: 'MYSQL_PASSWORD', set: Boolean(mysqlStatus?.envStatus?.passwordSet) },
+                { key: 'MYSQL_DATABASE', set: Boolean(mysqlStatus?.envStatus?.databaseSet) },
+              ].map((item) => (
+                <div
+                  key={item.key}
+                  className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-700 flex items-center justify-between gap-2 text-xs"
+                >
+                  <span className="font-mono font-bold text-slate-700 dark:text-slate-200 truncate">
+                    {item.key}
+                  </span>
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
+                      item.set
+                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                        : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+                    }`}
+                  >
+                    {item.set ? 'Terpasang' : 'Kosong'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Table Checklist */}
+          <div className="bg-white dark:bg-slate-800 rounded-3xl p-6 sm:p-8 border border-slate-200 dark:border-slate-700 shadow-sm space-y-4">
+            <h2 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
+              <Database className="w-5 h-5 text-blue-500" />
               <span>Status 11 Tabel Database MySQL</span>
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">

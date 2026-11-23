@@ -1,4 +1,12 @@
+import dns from 'dns';
 import mysql, { Pool, RowDataPacket } from 'mysql2/promise';
+
+try {
+  // Prefer IPv4 so Hostinger Remote MySQL receives the server IPv4 address instead of IPv6
+  dns.setDefaultResultOrder('ipv4first');
+} catch {
+  // Ignore if unsupported by runtime
+}
 
 export type AllowedMysqlTable =
   | 'school_settings'
@@ -185,19 +193,69 @@ const BOOLEAN_COLUMNS = new Set([
 ]);
 const JSON_COLUMNS = new Set(['social_links']);
 
+export interface MysqlTestResult {
+  configured: boolean;
+  connected: boolean;
+  host: string;
+  port: number;
+  database: string;
+  userMasked: string;
+  latencyMs?: number;
+  tablesFound: string[];
+  errorCode?: string;
+  clientIp?: string;
+  envStatus: {
+    hostSet: boolean;
+    portSet: boolean;
+    userSet: boolean;
+    passwordSet: boolean;
+    databaseSet: boolean;
+  };
+  message: string;
+}
+
+const MYSQL_FAILURE_COOLDOWN_MS = 60_000;
+
 declare global {
   var _mysqlPool: Pool | undefined;
+  var _mysqlPoolKey: string | undefined;
+  var _mysqlFailureCache: { result: MysqlTestResult; expiresAt: number } | undefined;
+}
+
+function maskMysqlUser(user: string): string {
+  if (!user) return '';
+  return user.length > 4 ? `${user.slice(0, 3)}***${user.slice(-2)}` : '***';
 }
 
 export function getMysqlEnvConfig() {
   const host = (process.env.MYSQL_HOST || '').trim();
   const port = parseInt((process.env.MYSQL_PORT || '3306').trim(), 10) || 3306;
   const user = (process.env.MYSQL_USER || '').trim();
-  const password = process.env.MYSQL_PASSWORD || '';
+  const password = (process.env.MYSQL_PASSWORD || '').replace(/[\r\n]+$/g, '');
   const database = (process.env.MYSQL_DATABASE || '').trim();
+  const ssl = (process.env.MYSQL_SSL || '').trim().toLowerCase() === 'true';
 
   const isConfigured = Boolean(host && user && database);
-  return { host, port, user, password, database, isConfigured };
+  return {
+    host,
+    port,
+    user,
+    password,
+    database,
+    ssl,
+    isConfigured,
+    envStatus: {
+      hostSet: Boolean(host),
+      portSet: Boolean(process.env.MYSQL_PORT),
+      userSet: Boolean(user),
+      passwordSet: Boolean(password),
+      databaseSet: Boolean(database),
+    },
+  };
+}
+
+export function isMysqlInCooldown(): boolean {
+  return Boolean(global._mysqlFailureCache && global._mysqlFailureCache.expiresAt > Date.now());
 }
 
 export function getMysqlPool(): Pool | null {
@@ -206,17 +264,26 @@ export function getMysqlPool(): Pool | null {
     return null;
   }
 
+  const poolKey = `${cfg.host}:${cfg.port}:${cfg.user}:${cfg.database}:${cfg.ssl}:${cfg.password.length}`;
+  if (global._mysqlPool && global._mysqlPoolKey !== poolKey) {
+    global._mysqlPool.end().catch(() => {});
+    global._mysqlPool = undefined;
+    global._mysqlFailureCache = undefined;
+  }
+
   if (!global._mysqlPool) {
+    global._mysqlPoolKey = poolKey;
     global._mysqlPool = mysql.createPool({
       host: cfg.host,
       port: cfg.port,
       user: cfg.user,
       password: cfg.password,
       database: cfg.database,
+      ssl: cfg.ssl ? { rejectUnauthorized: true } : undefined,
       waitForConnections: true,
       connectionLimit: 10,
       queueLimit: 0,
-      connectTimeout: 5000,
+      connectTimeout: 8000,
       charset: 'utf8mb4',
     });
   }
@@ -297,23 +364,84 @@ function normalizeRowFromMysql(table: AllowedMysqlTable, row: RowDataPacket): Re
   return out;
 }
 
-export async function testMysqlConnection(): Promise<{
-  configured: boolean;
-  connected: boolean;
-  host: string;
-  port: number;
-  database: string;
-  userMasked: string;
-  latencyMs?: number;
-  tablesFound: string[];
+function formatMysqlDiagnosticError(err: any): {
+  errorCode: string;
+  clientIp?: string;
   message: string;
-}> {
+} {
+  const code = String(err?.code || 'UNKNOWN');
+  const rawMsg = String(err?.message || '');
+  const accessMatch = rawMsg.match(/Access denied for user '([^']*)'@'([^']*)'/i);
+  const clientIp = accessMatch?.[2];
+
+  switch (code) {
+    case 'ECONNREFUSED':
+      return {
+        errorCode: code,
+        message:
+          'Koneksi ditolak (ECONNREFUSED). Server MySQL tidak aktif di host/port yang dituju. Periksa MYSQL_HOST dan MYSQL_PORT.',
+      };
+    case 'ETIMEDOUT':
+    case 'ENETUNREACH':
+    case 'EHOSTUNREACH':
+      return {
+        errorCode: code,
+        message: `Koneksi ke server MySQL timeout (${code}). Port 3306 mungkin diblokir firewall atau Remote MySQL Hostinger belum diaktifkan.`,
+      };
+    case 'ENOTFOUND':
+      return {
+        errorCode: code,
+        message: 'Hostname MySQL tidak ditemukan (ENOTFOUND). Periksa kembali nilai MYSQL_HOST.',
+      };
+    case 'ER_ACCESS_DENIED_ERROR':
+      return {
+        errorCode: code,
+        clientIp,
+        message: clientIp
+          ? `Akses ditolak oleh MySQL untuk koneksi dari IP ${clientIp}. Pastikan IP tersebut (atau "%" / Any Host) sudah diizinkan di Hostinger → Remote MySQL, serta periksa MYSQL_USER dan MYSQL_PASSWORD.`
+          : 'Akses ditolak oleh MySQL (ER_ACCESS_DENIED_ERROR). Periksa MYSQL_USER, MYSQL_PASSWORD, dan izin Remote MySQL Hostinger.',
+      };
+    case 'ER_BAD_DB_ERROR':
+      return {
+        errorCode: code,
+        message:
+          'Nama database tidak ditemukan (ER_BAD_DB_ERROR). Pastikan MYSQL_DATABASE sesuai (misal: u637089879_db_pancasila).',
+      };
+    default:
+      return {
+        errorCode: code,
+        message:
+          'Koneksi ke server MySQL gagal. Periksa konfigurasi host, user, password, dan izin Remote MySQL Hostinger.',
+      };
+  }
+}
+
+function recordMysqlFailure(err: any): MysqlTestResult {
   const cfg = getMysqlEnvConfig();
-  const userMasked = cfg.user
-    ? cfg.user.length > 4
-      ? `${cfg.user.slice(0, 3)}***${cfg.user.slice(-2)}`
-      : '***'
-    : '';
+  const diag = formatMysqlDiagnosticError(err);
+  const result: MysqlTestResult = {
+    configured: cfg.isConfigured,
+    connected: false,
+    host: cfg.host || '127.0.0.1',
+    port: cfg.port,
+    database: cfg.database || 'u637089879_db_pancasila',
+    userMasked: maskMysqlUser(cfg.user),
+    tablesFound: [],
+    errorCode: diag.errorCode,
+    clientIp: diag.clientIp,
+    envStatus: cfg.envStatus,
+    message: diag.message,
+  };
+  global._mysqlFailureCache = {
+    result,
+    expiresAt: Date.now() + MYSQL_FAILURE_COOLDOWN_MS,
+  };
+  return result;
+}
+
+export async function testMysqlConnection(forceRefresh = false): Promise<MysqlTestResult> {
+  const cfg = getMysqlEnvConfig();
+  const userMasked = maskMysqlUser(cfg.user);
 
   if (!cfg.isConfigured) {
     return {
@@ -324,9 +452,17 @@ export async function testMysqlConnection(): Promise<{
       database: cfg.database || 'u637089879_db_pancasila',
       userMasked,
       tablesFound: [],
+      errorCode: 'NOT_CONFIGURED',
+      envStatus: cfg.envStatus,
       message:
-        'Variabel environment MySQL (MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE) belum diatur di server. Aplikasi berjalan menggunakan penyimpanan lokal server (data/store.json).',
+        'Variabel environment MySQL (MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE) belum diatur di server. Untuk saat ini aplikasi tetap berjalan menggunakan penyimpanan lokal server (data/store.json).',
     };
+  }
+
+  if (forceRefresh) {
+    global._mysqlFailureCache = undefined;
+  } else if (global._mysqlFailureCache && global._mysqlFailureCache.expiresAt > Date.now()) {
+    return global._mysqlFailureCache.result;
   }
 
   const pool = getMysqlPool();
@@ -339,6 +475,8 @@ export async function testMysqlConnection(): Promise<{
       database: cfg.database,
       userMasked,
       tablesFound: [],
+      errorCode: 'POOL_UNAVAILABLE',
+      envStatus: cfg.envStatus,
       message: 'Pool MySQL belum tersedia.',
     };
   }
@@ -349,6 +487,8 @@ export async function testMysqlConnection(): Promise<{
     const [rows] = await pool.execute<RowDataPacket[]>('SHOW TABLES');
     const tablesFound = rows.map((r) => String(Object.values(r)[0]));
     const latencyMs = Date.now() - start;
+
+    global._mysqlFailureCache = undefined;
 
     const requiredTables = Object.values(STORE_TO_MYSQL_TABLE);
     const uniqueRequired = Array.from(new Set(requiredTables));
@@ -363,23 +503,15 @@ export async function testMysqlConnection(): Promise<{
       userMasked,
       latencyMs,
       tablesFound,
+      envStatus: cfg.envStatus,
       message:
         missing.length === 0
           ? `Terhubung ke MySQL "${cfg.database}" (${latencyMs}ms). Seluruh ${tablesFound.length} tabel siap digunakan.`
           : `Terhubung ke MySQL "${cfg.database}" (${latencyMs}ms), namun ${missing.length} tabel belum dibuat (${missing.join(', ')}). Jalankan mysql-schema.sql di phpMyAdmin.`,
     };
   } catch (err: any) {
-    console.error('[MySQL] Connection test failed:', err?.message || err);
-    return {
-      configured: true,
-      connected: false,
-      host: cfg.host,
-      port: cfg.port,
-      database: cfg.database,
-      userMasked,
-      tablesFound: [],
-      message: 'Koneksi ke server MySQL gagal. Periksa konfigurasi host, user, password, atau firewall database.',
-    };
+    const failedResult = recordMysqlFailure(err);
+    return failedResult;
   }
 }
 
@@ -387,6 +519,7 @@ export async function upsertMysqlRow(
   table: AllowedMysqlTable,
   row: Record<string, any>
 ): Promise<void> {
+  if (isMysqlInCooldown()) return;
   const pool = getMysqlPool();
   if (!pool) return;
 
@@ -416,6 +549,7 @@ export async function replaceMysqlTableRows(
   table: AllowedMysqlTable,
   rows: Record<string, any>[]
 ): Promise<void> {
+  if (isMysqlInCooldown()) return;
   const pool = getMysqlPool();
   if (!pool) return;
 
@@ -430,6 +564,7 @@ export async function deleteMysqlRowById(
   table: AllowedMysqlTable,
   id: string
 ): Promise<void> {
+  if (isMysqlInCooldown()) return;
   const pool = getMysqlPool();
   if (!pool) return;
 
@@ -437,6 +572,7 @@ export async function deleteMysqlRowById(
 }
 
 export async function readAllStoreFromMysql(): Promise<Record<string, any> | null> {
+  if (isMysqlInCooldown()) return null;
   const pool = getMysqlPool();
   if (!pool) return null;
 
@@ -476,12 +612,13 @@ export async function readAllStoreFromMysql(): Promise<Record<string, any> | nul
 
     return Object.keys(result).length > 0 ? result : null;
   } catch (err: any) {
-    console.error('[MySQL] Failed reading store from MySQL:', err?.message || err);
+    recordMysqlFailure(err);
     return null;
   }
 }
 
 export async function writeAllStoreToMysql(payload: Record<string, any>): Promise<boolean> {
+  if (isMysqlInCooldown()) return false;
   const pool = getMysqlPool();
   if (!pool) return false;
 
@@ -522,7 +659,7 @@ export async function writeAllStoreToMysql(payload: Record<string, any>): Promis
     }
     return true;
   } catch (err: any) {
-    console.error('[MySQL] Failed writing full store to MySQL:', err?.message || err);
+    recordMysqlFailure(err);
     return false;
   }
 }

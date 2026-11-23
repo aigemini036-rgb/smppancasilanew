@@ -5,6 +5,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import {
   getMysqlEnvConfig,
+  isMysqlInCooldown,
   testMysqlConnection,
   readAllStoreFromMysql,
   writeAllStoreToMysql,
@@ -89,7 +90,7 @@ app.get('/api/mysql/status', async (req, res) => {
 
 app.post('/api/mysql/test', async (req, res) => {
   try {
-    const status = await testMysqlConnection();
+    const status = await testMysqlConnection(true);
     res.json(status);
   } catch (err: any) {
     console.error('[Server] MySQL test error:', err?.message || err);
@@ -195,7 +196,7 @@ app.post('/api/data/:table', async (req, res) => {
   writeJsonFile(STORE_PATH, store);
 
   let mysqlSynced = false;
-  if (getMysqlEnvConfig().isConfigured) {
+  if (getMysqlEnvConfig().isConfigured && !isMysqlInCooldown()) {
     try {
       if (mysqlTable === 'school_settings') {
         await upsertMysqlRow('school_settings', store.settings);
@@ -206,7 +207,7 @@ app.post('/api/data/:table', async (req, res) => {
       }
       mysqlSynced = true;
     } catch (err: any) {
-      console.error(`[MySQL] Failed upserting into ${mysqlTable}:`, err?.message || err);
+      console.log(`[MySQL] Fallback ke store lokal saat simpan (${mysqlTable}):`, err?.code || 'ERR');
     }
   }
 
@@ -242,12 +243,12 @@ app.delete('/api/data/:table/:id', async (req, res) => {
   }
 
   let mysqlSynced = false;
-  if (getMysqlEnvConfig().isConfigured) {
+  if (getMysqlEnvConfig().isConfigured && !isMysqlInCooldown()) {
     try {
       await deleteMysqlRowById(mysqlTable, id);
       mysqlSynced = true;
     } catch (err: any) {
-      console.error(`[MySQL] Failed deleting ${id} from ${mysqlTable}:`, err?.message || err);
+      console.log(`[MySQL] Fallback ke store lokal saat hapus (${mysqlTable}):`, err?.code || 'ERR');
     }
   }
 

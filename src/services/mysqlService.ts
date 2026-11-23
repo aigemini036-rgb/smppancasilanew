@@ -7,6 +7,15 @@ export interface MysqlStatusInfo {
   userMasked: string;
   latencyMs?: number;
   tablesFound: string[];
+  errorCode?: string;
+  clientIp?: string;
+  envStatus?: {
+    hostSet: boolean;
+    portSet: boolean;
+    userSet: boolean;
+    passwordSet: boolean;
+    databaseSet: boolean;
+  };
   message: string;
 }
 
@@ -45,6 +54,7 @@ export async function fetchMysqlStatus(): Promise<MysqlStatusInfo> {
     database: 'u637089879_db_pancasila',
     userMasked: '',
     tablesFound: [],
+    errorCode: 'UNREACHABLE',
     message: 'Server backend tidak merespon saat memeriksa status MySQL.',
   };
 }
@@ -66,6 +76,7 @@ export async function testMysqlServerConnection(): Promise<MysqlStatusInfo> {
     database: 'u637089879_db_pancasila',
     userMasked: '',
     tablesFound: [],
+    errorCode: 'UNREACHABLE',
     message: 'Gagal menghubungi endpoint pengujian MySQL.',
   };
 }
